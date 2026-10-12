@@ -1,64 +1,79 @@
-# Hono Server 搭建教程
+# server-hono 搭建教程
 
-从 NestJS + Fastify 模板（错误体系 + 会话认证 + RBAC 鉴权）迁移到 Hono 的完整 step-by-step 教程。
-每一步都是完整代码，照着复制粘贴即可跑通。
+将 `apps/server`（NestJS + Fastify）的横切架构迁移到 Hono 的 step-by-step 实施文档。
+每一步都是完整代码，按顺序复制粘贴即可跑通。
 
-## 最终你会得到什么
+## 架构决策（讨论结论，先读）
 
-| 能力 | 实现 |
-|---|---|
-| 统一错误体系 | 错误码注册表 + `AppException` + 全局 `onError`（脱敏日志、只记 5xx、`x-request-id`、Bearer 质询） |
-| 入参校验 | `zod` + `@hono/zod-validator`，校验失败输出统一 `ApiFailure` |
-| 会话认证 | Bearer 不透明 token + Redis 滑动续期，`sessionAuth` 全局中间件 |
-| 权限鉴权 | `accessPolicy({...})` 路由级中间件，声明式策略 + 默认拒绝，支持 platform/company/project 三级作用域 |
+| 决策点 | 结论 | 理由 |
+|---|---|---|
+| 位置 | monorepo 下新建 `apps/server-hono` | 不动现有 Nest 版，迁移验证完再切换 |
+| 工具链 | **vite-plus 1.1.0**（`vp run/test/fmt/check`） | 与 monorepo 约定一致；只管编译测试格式化，与运行时无关 |
+| 运行时 | **Node 为主，Bun 可选** | 双平台靠分层实现：代码只写运行时无关 API，两个薄入口 `main.node.ts` / `main.bun.ts` |
+| Redis 客户端 | `ioredis` | Node/Bun 双平台都能跑；Bun 原生客户端和 BullMQ 适配器留作后续优化 |
+| 队列 | 暂不迁移；需要时上 BullMQ v6（已支持 Bun） | v6 后端可插拔（Redis/PostgreSQL），不再是 Bun 障碍 |
+| 数据库 | Drizzle ORM + PostgreSQL | 与 Nest 版一致，schema 从简（users + access_grants） |
+| API 文档 | `@hono/zod-openapi` + `@hono/swagger-ui` | zod schema 即 OpenAPI，UI 挂 `/api-docs` |
+| 类型复用 | workspace `shared` 包 | `ApiFailure / ApiErrorDetail / AccessScope / ScopeType` 直接 import |
+
+### 双平台分层图
+
+```
+工具链层  vite-plus ────────────── 编译/测试/lint，与运行时无关
+代码层    src/** ──────────────── hono + zod + drizzle + ioredis（全是跨运行时库）
+入口层    main.node.ts → @hono/node-server     ← 唯一感知运行时的两个文件
+          main.bun.ts  → Bun.serve
+```
+
+### 双平台已知风险点
+
+- `argon2` 是 napi 原生模块：Node 无问题；Bun 对 napi 基本兼容，**首次用 Bun 入口时先验证登录接口**，不行就换 `@node-rs/argon2`（同样 napi 但预编译更全）或 `bcryptjs`（纯 JS）。
 
 ## 最终目录结构
 
 ```
-hono/
+apps/server-hono/
 ├── package.json
 ├── tsconfig.json
+├── vite.config.ts
+├── drizzle.config.ts
 ├── .env
 └── src/
-    ├── main.ts                        # 启动入口
-    ├── app.ts                         # createApp：全局中间件 + onError + 路由挂载
-    ├── shared/
-    │   └── api-failure.ts             # 统一错误响应类型
+    ├── main.node.ts                 # Node 入口
+    ├── main.bun.ts                  # Bun 入口（可选）
+    ├── app.ts                       # createApp：中间件 + 路由 + OpenAPI
+    ├── config/env.ts                # 环境变量
     ├── common/
-    │   ├── errors/
-    │   │   ├── app-error.ts           # AppErrorDefinition + AppException
-    │   │   └── common.errors.ts       # COMMON_ERRORS 注册表
-    │   ├── http/
-    │   │   └── on-error.ts            # 全局错误归一化 + 脱敏日志
-    │   └── access/
-    │       ├── scope.ts               # 从路由参数推导作用域
-    │       └── access-policy.ts       # accessPolicy 中间件工厂
+    │   ├── errors/app-error.ts      # AppErrorDefinition + AppException
+    │   ├── errors/common.errors.ts  # COMMON_ERRORS
+    │   ├── http/on-error.ts         # onError/notFound：归一化 + 脱敏日志
+    │   └── access/scope.ts          # 作用域推导
+    │   └── access/access-policy.ts  # accessPolicy 中间件工厂
+    ├── db/
+    │   ├── index.ts                 # pg.Pool + drizzle
+    │   └── schema.ts                # users + access_grants
     └── modules/
-        ├── auth/
-        │   ├── auth.errors.ts
-        │   ├── session.service.ts     # token 生成/digest + Redis 存取
-        │   ├── session-auth.ts        # sessionAuth 中间件
-        │   └── auth.routes.ts         # login / logout / me
-        ├── access/
-        │   ├── access.errors.ts
-        │   └── access.service.ts      # 权限判定（含 {scope} 占位符解析）
-        └── companies/
-            └── companies.routes.ts    # 示例业务模块
+        ├── auth/   auth.errors.ts / session.service.ts / user.repository.ts
+        │           session-auth.ts / auth.routes.ts
+        ├── access/ access.errors.ts / access.service.ts
+        └── companies/ companies.routes.ts   # 示例业务模块
 ```
 
 ## 步骤索引
 
-1. [01-初始化项目](./01-初始化项目.md) — 建目录、装依赖、tsconfig、.env
-2. [02-错误体系](./02-错误体系.md) — ApiFailure 类型 + AppException + COMMON_ERRORS（框架无关，最先搭）
-3. [03-全局错误处理](./03-全局错误处理.md) — onError 归一化 + 日志脱敏
-4. [04-认证](./04-认证.md) — Redis 会话 + sessionAuth 中间件 + 登录路由
-5. [05-权限](./05-权限.md) — accessPolicy 中间件 + 三级作用域
-6. [06-组装与示例](./06-组装与示例.md) — app.ts / main.ts / 示例业务路由
-7. [07-启动与验证](./07-启动与验证.md) — 启动 + curl 验证每个场景
+1. [01-初始化与依赖](./01-初始化与依赖.md)
+2. [02-错误体系](./02-错误体系.md)
+3. [03-全局错误处理](./03-全局错误处理.md)
+4. [04-数据层](./04-数据层.md)
+5. [05-认证与权限](./05-认证与权限.md)
+6. [06-组装与 OpenAPI](./06-组装与OpenAPI.md)
+7. [07-启动与验证](./07-启动与验证.md)
 
 ## 前置条件
 
-- Node.js ≥ 20，pnpm
-- 本地 Redis（`redis://localhost:6379`），没有的话：`docker run -d -p 6379:6379 redis:7`
+- pnpm（monorepo 根目录统一安装）
+- PostgreSQL（`docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16`）
+- Redis（`docker run -d -p 6379:6379 redis:7`）
+- 可选：Bun（仅验证双入口时需要）
 
-开始 → [01-初始化项目](./01-初始化项目.md)
+开始 → [01-初始化与依赖](./01-初始化与依赖.md)
